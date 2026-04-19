@@ -58,3 +58,29 @@ def redis_kwargs() -> dict:
         "host": os.environ.get("REDIS_HOST", "spark-redis"),
         "port": int(os.environ.get("REDIS_PORT", "6379")),
     }
+
+
+def minio_kwargs() -> dict:
+    return {
+        "endpoint": os.environ.get("MINIO_ENDPOINT", "http://spark-minio:9000"),
+        "access_key": os.environ.get("MINIO_ACCESS_KEY", "minioadmin"),
+        "secret_key": os.environ.get("MINIO_SECRET_KEY", "minioadmin"),
+    }
+
+
+def starrocks_kwargs() -> dict:
+    return {
+        "host": os.environ.get("STARROCKS_HOST", "spark-starrocks"),
+        "port": int(os.environ.get("STARROCKS_FE_PORT", "9030")),
+        "user": os.environ.get("STARROCKS_USER", "root"),
+        "password": os.environ.get("STARROCKS_PASSWORD", ""),
+    }
+
+
+def starrocks_jdbc() -> dict:
+    return {
+        "url": f"jdbc:mysql://{os.environ.get('STARROCKS_HOST', 'spark-starrocks')}:{os.environ.get('STARROCKS_FE_PORT', '9030')}/",
+        "user": os.environ.get("STARROCKS_USER", "root"),
+        "password": os.environ.get("STARROCKS_PASSWORD", ""),
+        "driver": "com.mysql.cj.jdbc.Driver",
+    }

@@ -17,6 +17,7 @@ help:
 	@echo "  make data-spark             Re-run the in-container data bootstrap (idempotent)"
 	@echo "  make test-spark             Run the stage pytest suite inside spark-jupyter"
 	@echo "  make spark-migrate          Run pipeline.migrate() against spark-postgres (idempotent)"
+	@echo "  make spark-reset            Wipe all stores (Postgres, StarRocks, Redis, MinIO)"
 	@echo "  make spark-producer-start   Start the file-drop producer inside spark-jupyter"
 	@echo "  make spark-producer-stop    Stop the running producer"
 	@echo "  make spark-producer-status  Show producer + bucket state"
@@ -47,6 +48,9 @@ test-spark:
 
 spark-migrate:
 	docker exec spark-jupyter python -c "from pipeline import config; from pipeline.migrate import migrate; migrate(config.postgres_kwargs()); print('[migrate] done')"
+
+spark-reset:
+	docker exec spark-jupyter python -c "from pipeline import config; from pipeline.reset import reset_all; reset_all(config.postgres_kwargs(), config.redis_kwargs()); print('[reset] all stores wiped')"
 
 spark-producer-start:
 	docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py start
