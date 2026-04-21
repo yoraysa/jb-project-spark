@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import boto3
 import psycopg2
 import mysql.connector
+import redis
 from botocore.client import Config
 from pyspark.sql import SparkSession, functions as F
 
@@ -26,10 +27,12 @@ def run_elt(landing_dir: str, connections: dict) -> None:
     """
     paths = connections['paths']
     pg_cfg = connections['postgres']
-    m_cfg = connections['minio']
+    from pipeline import config
+    m_cfg = connections.get('minio', config.minio_kwargs())
 
     landing_path = Path(landing_dir)
-    archive_path = Path(paths.archive)
+    archive_dir = paths["archive"] if isinstance(paths, dict) else paths.archive
+    archive_path = Path(archive_dir)
 
     # Initialize S3 client
     s3 = boto3.client('s3',
@@ -117,12 +120,10 @@ def _update_status(
     file_paths: list[str],
     status: str,
     ts_col: str,
-    increment_attempts: bool = False,
 ):
     """Helper to bulk update file status in Postgres."""
     if not file_paths:
         return
-    attempts_update_sql = ", etl_attempts = etl_attempts + 1" if increment_attempts else ""
     conn = psycopg2.connect(**pg_cfg)
     try:
         with conn.cursor() as cur:
@@ -130,7 +131,6 @@ def _update_status(
                 UPDATE etl_file_status SET
                     status = %s,
                     {ts_col} = clock_timestamp()
-                    {attempts_update_sql}
                 WHERE file_path = ANY(%s);
             """, (status, file_paths))
         conn.commit()
@@ -180,6 +180,27 @@ def _write_gold_denorm(sr_cfg: dict, rows: list[tuple[str, str, int, float]]) ->
         conn.close()
 
 
+def _sync_hourly_revenue_to_redis(r_cfg: dict, rows: list[tuple[int, float]]) -> None:
+    """
+    Fully refresh serving cache from gold hourly_revenue.
+    Stores 24 documents as Redis hashes: hourly_revenue:{hour}.
+    """
+    r = redis.Redis(**r_cfg)
+    pipe = r.pipeline()
+    for hour in range(24):
+        pipe.delete(f"hourly_revenue:{hour}")
+
+    revenue_by_hour = {hour: revenue for hour, revenue in rows}
+    for hour in range(24):
+        revenue = float(revenue_by_hour.get(hour, 0.0))
+        # Keep both names to be backward/forward compatible with callers.
+        pipe.hset(
+            f"hourly_revenue:{hour}",
+            mapping={"revenue": revenue},
+        )
+    pipe.execute()
+
+
 
 def run_etl(
     spark: SparkSession,
@@ -189,8 +210,10 @@ def run_etl(
     """
     End-to-End ETL Pipeline.
     """
+    from pipeline import config
+
     pg_cfg = connections['postgres']
-    m_cfg = connections['minio']
+    m_cfg = connections.get('minio', config.minio_kwargs())
 
     # --- Phase 0: Spark Configuration ---
     spark.conf.set("fs.s3a.endpoint", m_cfg['endpoint'])
@@ -235,7 +258,6 @@ def run_etl(
                 files_to_silver,
                 'silver',
                 'status_silver_ts',
-                increment_attempts=True,
             )
             print(f"[ETL] Silver Stage complete.")
         except Exception as e:
@@ -257,8 +279,8 @@ def run_etl(
         try:
             # For simplicity, we process the current silver batch by reading all silver/trips
             df = spark.read.parquet("s3a://silver/trips")
-            sr_jdbc = connections['starrocks_jdbc']
-            sr_cfg = connections['starrocks']
+            sr_jdbc = connections.get('starrocks_jdbc', config.starrocks_jdbc())
+            sr_cfg = connections.get('starrocks', config.starrocks_kwargs())
             
             # --- 3.1: hourly_revenue (Join & Sum in Spark) ---
             
@@ -317,25 +339,21 @@ def run_etl(
             ]
             _write_gold_denorm(sr_cfg, zh_rows)
 
+            # Stage transition to gold is complete.
             _update_status(pg_cfg, files_to_gold, 'gold', 'status_gold_ts')
+
+            # --- Phase 4: Gold -> Serving (Redis fan-out operations) ---
+            r_cfg = connections.get('redis', config.redis_kwargs())
+            _sync_hourly_revenue_to_redis(r_cfg, hourly_rows)
+
+            # Mark done only after ALL gold fan-out operations complete successfully.
+            _update_status(pg_cfg, files_to_gold, 'done', 'status_done_ts')
             print(f"[ETL] Gold Stage complete.")
         except Exception as e:
             print(f"[ETL] Gold Stage ERROR: {e}")
             import traceback
             traceback.print_exc()
             raise
-
-    # --- Phase 4: Gold -> Done ---
-    # conn = psycopg2.connect(**pg_cfg)
-    # try:
-    #     with conn.cursor() as cur:
-    #         cur.execute("SELECT file_path FROM etl_file_status WHERE status = 'gold'")
-    #         files_to_done = [r[0] for r in cur.fetchall()]
-    # finally:
-    #     conn.close()
-# 
-    # if files_to_done:
-    #     _update_status(pg_cfg, files_to_done, 'done', 'status_done_ts')
 
 
 if __name__ == "__main__":

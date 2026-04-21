@@ -34,4 +34,19 @@ def total_revenue(d: str, h: int) -> float:
 
 
 def avg_revenue(h: int) -> float:
-    raise NotImplementedError("Stage 4: implement avg_revenue — see stages/04-backend-serving/")
+    import redis
+    from pipeline import config
+
+    if h < 0 or h > 23:
+        raise ValueError(f"hour must be in range [0, 23], got {h}")
+
+    r = redis.Redis(**config.redis_kwargs())
+    doc = r.hgetall(f"hourly_revenue:{h}")
+    if not doc:
+        raise LookupError(f"missing redis document for key 'hourly_revenue:{h}'")
+
+    # Prefer canonical field name; fallback for backward compatibility.
+    raw = doc.get(b"revenue")
+    if raw is None or raw == 0:
+        raise KeyError(f"redis document 'hourly_revenue:{h}' does not have a revenue value")
+    return float(raw)

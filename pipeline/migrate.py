@@ -24,7 +24,6 @@ def migrate(pg_kwargs: dict) -> None:
             CREATE TABLE IF NOT EXISTS etl_file_status (
                 file_path TEXT PRIMARY KEY,
                 status VARCHAR(20) NOT NULL DEFAULT 'bronze',
-                etl_attempts INT DEFAULT 0,
                 status_bronze_ts TIMESTAMP,
                 status_silver_ts TIMESTAMP,
                 status_gold_ts TIMESTAMP,
@@ -149,10 +148,17 @@ def migrate(pg_kwargs: dict) -> None:
         except:
             s3.create_bucket(Bucket=b)
 
-    # 4. Redis - Cache Clearing
+    # 4. Redis - Cache Clearing + Serving collection initialization
     r_cfg = config.redis_kwargs()
     r = redis.Redis(**r_cfg)
     r.flushdb()
+    pipe = r.pipeline()
+    for hour in range(24):
+        pipe.hset(
+            f"hourly_revenue:{hour}",
+            mapping={"revenue": 0.0},
+        )
+    pipe.execute()
     print("✅ Migration complete: Postgres, StarRocks, MinIO, and Redis initialized.")
 
 if __name__ == "__main__":

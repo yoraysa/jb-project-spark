@@ -24,6 +24,11 @@ def reset_all(pg_kwargs: dict, redis_kwargs: dict) -> None:
     _reset_minio()
 
 
+def clear_data(pg_kwargs: dict, redis_kwargs: dict) -> None:
+    """Backward-compatible alias used by the test harness."""
+    reset_all(pg_kwargs, redis_kwargs)
+
+
 def _reset_postgres(pg_kwargs: dict) -> None:
     """Truncates all public tables in the Postgres database."""
     with psycopg2.connect(**pg_kwargs) as conn:
