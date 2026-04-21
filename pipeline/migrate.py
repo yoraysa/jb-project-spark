@@ -31,6 +31,7 @@ def migrate(pg_kwargs: dict) -> None:
                 status_done_ts TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_status ON etl_file_status(status);
+            CREATE INDEX IF NOT EXISTS idx_etl_file_status_file_path ON etl_file_status(file_path);
         """)
     conn_pg.commit()
     conn_pg.close()
@@ -59,7 +60,7 @@ def migrate(pg_kwargs: dict) -> None:
             """
 
             cur.execute(f"""
-                CREATE EXTERNAL TABLE IF NOT EXISTS bronze (
+                CREATE EXTERNAL TABLE IF NOT EXISTS _bronze (
                     VendorID BIGINT,
                     tpep_pickup_datetime DATETIME,
                     tpep_dropoff_datetime DATETIME,
@@ -87,7 +88,7 @@ def migrate(pg_kwargs: dict) -> None:
             """)
 
             cur.execute(f"""
-                CREATE EXTERNAL TABLE IF NOT EXISTS silver (
+                CREATE EXTERNAL TABLE IF NOT EXISTS _silver (
                     date DATE,
                     hour INT,
                     PULocationID INT,
@@ -103,10 +104,10 @@ def migrate(pg_kwargs: dict) -> None:
 
             # --- AGGREGATED GOLD TABLES ---
             
-            # Table: gold_hourly_revenue (Summed hourly revenue across all days)
+            # Table: hourly_revenue (Summed hourly revenue across all days)
             # Uses PRIMARY KEY to support Spark-driven sum + upsert logic.
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS gold_hourly_revenue (
+                CREATE TABLE IF NOT EXISTS hourly_revenue (
                     hour INT NOT NULL,
                     revenue DECIMAL(18, 2) NOT NULL
                 ) PRIMARY KEY (hour)
@@ -114,10 +115,10 @@ def migrate(pg_kwargs: dict) -> None:
                 PROPERTIES ("replication_num" = "1");
             """)
             
-            # Table: gold_hour_denorm (By Zone and Hour)
+            # Table: hour_denorm (By Zone and Hour)
             # Uses AGGREGATE KEY to automatically handle multi-file contributions.
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS gold_hour_denorm (
+                CREATE TABLE IF NOT EXISTS hour_denorm (
                     zone VARCHAR(255) NOT NULL,
                     date DATE NOT NULL,
                     hour INT NOT NULL,

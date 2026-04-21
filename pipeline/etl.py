@@ -14,6 +14,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import boto3
 import psycopg2
+import mysql.connector
 from botocore.client import Config
 from pyspark.sql import SparkSession, functions as F
 
@@ -46,8 +47,30 @@ def run_elt(landing_dir: str, connections: dict) -> None:
 
     print(f"[ELT] Found {len(files)} files in landing. Processing...")
 
+    # Load known files once so duplicate checks are fast and consistent.
+    file_names = [f.name for f in files]
+    conn = psycopg2.connect(**pg_cfg)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_path FROM etl_file_status WHERE file_path = ANY(%s)",
+                (file_names,),
+            )
+            known_files = {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
     def process_file(file_path: Path):
         try:
+            # File already tracked in Postgres -> already loaded to bronze in the past.
+            if file_path.name in known_files:
+                archive_dest = archive_path / file_path.name
+                if archive_dest.exists():
+                    file_path.unlink()
+                else:
+                    file_path.rename(archive_dest)
+                return
+
             # 1. Archive Check
             if (archive_path / file_path.name).exists():
                 file_path.unlink()
@@ -78,16 +101,28 @@ def run_elt(landing_dir: str, connections: dict) -> None:
         except Exception as e:
             print(f"[ELT] Error processing {file_path.name}: {e}")
 
+    # We use a ThreadPoolExecutor to parallelize the I/O-bound ingestion phase.
+    # Each file in 'landing' is uploaded to MinIO and its metadata is updated in Postgres.
+    # Using multiple workers (10) significantly speeds up Phase 1 when handling many small files.
     with ThreadPoolExecutor(max_workers=10) as executor:
+        # executor.map returns a lazy iterator; we wrap it in list() to force the 
+        # execution of all tasks immediately.
         list(executor.map(process_file, files))
 
     print(f"[ELT] Phase 1 (Ingestion) finished.")
 
 
-def _update_status(pg_cfg: dict, file_paths: list[str], status: str, ts_col: str):
+def _update_status(
+    pg_cfg: dict,
+    file_paths: list[str],
+    status: str,
+    ts_col: str,
+    increment_attempts: bool = False,
+):
     """Helper to bulk update file status in Postgres."""
     if not file_paths:
         return
+    attempts_update_sql = ", etl_attempts = etl_attempts + 1" if increment_attempts else ""
     conn = psycopg2.connect(**pg_cfg)
     try:
         with conn.cursor() as cur:
@@ -95,11 +130,55 @@ def _update_status(pg_cfg: dict, file_paths: list[str], status: str, ts_col: str
                 UPDATE etl_file_status SET
                     status = %s,
                     {ts_col} = clock_timestamp()
+                    {attempts_update_sql}
                 WHERE file_path = ANY(%s);
             """, (status, file_paths))
         conn.commit()
     finally:
         conn.close()
+
+
+def _write_gold_hourly(sr_cfg: dict, rows: list[tuple[int, float]]) -> None:
+    """Write hourly aggregates to StarRocks in one driver-side transaction."""
+    if not rows:
+        return
+    chunk_size = 1000
+    conn = mysql.connector.connect(**sr_cfg, database="nyc_taxi")
+    try:
+        with conn.cursor() as cur:
+            for i in range(0, len(rows), chunk_size):
+                cur.executemany(
+                    """
+                    INSERT INTO hourly_revenue (hour, revenue)
+                    VALUES (%s, %s);
+                    """,
+                    rows[i:i + chunk_size],
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_gold_denorm(sr_cfg: dict, rows: list[tuple[str, str, int, float]]) -> None:
+    """Append zone/date/hour aggregates to StarRocks in one driver-side transaction."""
+    if not rows:
+        return
+    chunk_size = 1000
+    conn = mysql.connector.connect(**sr_cfg, database="nyc_taxi")
+    try:
+        with conn.cursor() as cur:
+            for i in range(0, len(rows), chunk_size):
+                cur.executemany(
+                    """
+                    INSERT INTO hour_denorm (zone, date, hour, total_amount)
+                    VALUES (%s, %s, %s, %s);
+                    """,
+                    rows[i:i + chunk_size],
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 
 def run_etl(
@@ -151,7 +230,13 @@ def run_etl(
 
             df_silver.write.mode("overwrite").partitionBy("p_date").parquet("s3a://silver/trips")
             
-            _update_status(pg_cfg, files_to_silver, 'silver', 'status_silver_ts')
+            _update_status(
+                pg_cfg,
+                files_to_silver,
+                'silver',
+                'status_silver_ts',
+                increment_attempts=True,
+            )
             print(f"[ETL] Silver Stage complete.")
         except Exception as e:
             print(f"[ETL] Silver Stage ERROR: {e}")
@@ -173,14 +258,15 @@ def run_etl(
             # For simplicity, we process the current silver batch by reading all silver/trips
             df = spark.read.parquet("s3a://silver/trips")
             sr_jdbc = connections['starrocks_jdbc']
+            sr_cfg = connections['starrocks']
             
-            # --- 3.1: gold_hourly_revenue (Join & Sum in Spark) ---
+            # --- 3.1: hourly_revenue (Join & Sum in Spark) ---
             
             # Read existing table (Empty if first run)
             try:
                 existing_hourly_df = spark.read.format("jdbc") \
                     .option("url", f"{sr_jdbc['url']}nyc_taxi") \
-                    .option("dbtable", "gold_hourly_revenue") \
+                    .option("dbtable", "nyc_taxi.hourly_revenue") \
                     .option("user", sr_jdbc['user']) \
                     .option("password", sr_jdbc['password']) \
                     .option("driver", sr_jdbc['driver']) \
@@ -197,20 +283,17 @@ def run_etl(
             final_hourly = existing_hourly_df.join(new_hourly_agg, "hour", "outer") \
                 .select("hour", 
                         (F.coalesce(F.col("revenue"), F.lit(0)) + 
-                         F.coalesce(F.col("new_revenue"), F.lit(0))).alias("revenue")) \
+                         F.coalesce(F.col("new_revenue"), F.lit(0))).cast("decimal(18,2)").alias("revenue")) \
                 .filter("hour IS NOT NULL")
 
-            # Upsert back to StarRocks
-            final_hourly.coalesce(1).write.format("jdbc") \
-                .option("url", f"{sr_jdbc['url']}nyc_taxi") \
-                .option("dbtable", "gold_hourly_revenue") \
-                .option("user", sr_jdbc['user']) \
-                .option("password", sr_jdbc['password']) \
-                .option("driver", sr_jdbc['driver']) \
-                .mode("append") \
-                .save()
+            # Upsert to StarRocks from driver to avoid Spark task retry transaction storms.
+            hourly_rows = [
+                (int(r["hour"]), float(r["revenue"]))
+                for r in final_hourly.select("hour", "revenue").collect()
+            ]
+            _write_gold_hourly(sr_cfg, hourly_rows)
 
-            # --- 3.2: gold_hour_denorm (Join with zones.csv) ---
+            # --- 3.2: hour_denorm (Join with zones.csv) ---
             
             zones_df = spark.read.option("header", "true").csv("/home/jovyan/work/data/zones.csv") \
                         .select(F.col("LocationID").cast("int"), F.col("Zone"))
@@ -220,23 +303,19 @@ def run_etl(
                           .fillna({"zone": "Unknown"})
 
             df_zh = df_denorm.groupBy("zone", "date", "hour") \
-                             .agg(F.sum("total_amount").alias("total_amount")) \
+                             .agg(F.sum("total_amount").cast("decimal(18,2)").alias("total_amount")) \
                              .withColumn("p_date", F.col("date"))
             
             # Write to Gold Bucket (Partitioned)
             # coalesce(1) ensures one file per partition (date) to combat "tiny files" problem.
-            df_zh.coalesce(1).write.mode("overwrite").partitionBy("p_date").parquet("s3a://gold/gold_hour_denormalized")
+            df_zh.coalesce(1).write.mode("overwrite").partitionBy("p_date").parquet("s3a://gold/gold_hour_denorm")
             
-            # Write to StarRocks
-            # We use coalesce(1) here specifically for the JDBC sink to serial upload the aggregate.
-            df_zh.drop("p_date").coalesce(1).write.format("jdbc") \
-                .option("url", f"{sr_jdbc['url']}nyc_taxi") \
-                .option("dbtable", "gold_hour_denorm") \
-                .option("user", sr_jdbc['user']) \
-                .option("password", sr_jdbc['password']) \
-                .option("driver", sr_jdbc['driver']) \
-                .mode("append") \
-                .save()
+            # Write to StarRocks from driver in one transaction.
+            zh_rows = [
+                (r["zone"], r["date"].isoformat(), int(r["hour"]), float(r["total_amount"]))
+                for r in df_zh.drop("p_date").collect()
+            ]
+            _write_gold_denorm(sr_cfg, zh_rows)
 
             _update_status(pg_cfg, files_to_gold, 'gold', 'status_gold_ts')
             print(f"[ETL] Gold Stage complete.")
@@ -244,18 +323,19 @@ def run_etl(
             print(f"[ETL] Gold Stage ERROR: {e}")
             import traceback
             traceback.print_exc()
+            raise
 
     # --- Phase 4: Gold -> Done ---
-    conn = psycopg2.connect(**pg_cfg)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT file_path FROM etl_file_status WHERE status = 'gold'")
-            files_to_done = [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-    if files_to_done:
-        _update_status(pg_cfg, files_to_done, 'done', 'status_done_ts')
+    # conn = psycopg2.connect(**pg_cfg)
+    # try:
+    #     with conn.cursor() as cur:
+    #         cur.execute("SELECT file_path FROM etl_file_status WHERE status = 'gold'")
+    #         files_to_done = [r[0] for r in cur.fetchall()]
+    # finally:
+    #     conn.close()
+# 
+    # if files_to_done:
+    #     _update_status(pg_cfg, files_to_done, 'done', 'status_done_ts')
 
 
 if __name__ == "__main__":

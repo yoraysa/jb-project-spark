@@ -21,7 +21,7 @@ def total_revenue(d: str, h: int) -> float:
         with conn.cursor() as cur:
             cur.execute("USE nyc_taxi")
             cur.execute("""
-                SELECT SUM(total_amount) FROM gold_hour_denorm 
+                SELECT SUM(total_amount) FROM hour_denorm 
                 WHERE date = %s AND hour = %s
             """, (d, h))
 
