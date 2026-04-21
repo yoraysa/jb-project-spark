@@ -13,7 +13,24 @@ from __future__ import annotations
 
 
 def total_revenue(d: str, h: int) -> float:
-    raise NotImplementedError("Stage 3: implement total_revenue — see stages/03-etl-analyst-store/")
+    import mysql.connector
+    from pipeline import config
+    sr_cfg = config.starrocks_kwargs()
+    conn = mysql.connector.connect(**sr_cfg)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("USE nyc_taxi")
+            cur.execute("""
+                SELECT SUM(total_amount) FROM gold_hour_denorm 
+                WHERE date = %s AND hour = %s
+            """, (d, h))
+
+
+            res = cur.fetchone()
+            return float(res[0]) if res else 0.0
+    finally:
+        conn.close()
+
 
 
 def avg_revenue(h: int) -> float:

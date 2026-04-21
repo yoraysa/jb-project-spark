@@ -4,7 +4,7 @@
 - **Storage**: MinIO (Datalake - Bronze/Silver/Gold)
 - **Database (OLAP)**: StarRocks (Internal Primary Key tables)
 - **Serving (Cache)**: Redis
-- **Processing**: Apache Spark (Persistent Session - FAIR Scheduler)
+- **Processing**: Apache Spark
 - **Metadata/State**: Postgres (`etl_file_status`)
 - **Validation**: Pydantic
 
@@ -43,38 +43,45 @@
 | Column | Description |
 | :--- | :--- |
 | `file_path` | Unique file identifier (Index) |
-| `status` | `new` → `bronze` → `silver` → `gold` |
+| `status` | `bronze` → `silver` → `gold` → `done` |
 | `attempts` | Restart count |
-| `ts_new` / `ts_bronze` / etc | Timestamps for each stage |
+| `ts_bronze` / `ts_silver` / `ts_gold` / `ts_done` | Timestamps for each stage |
 
 ---
 
 ## ⚙️ Ingestion & ETL Flow
 
-### 1. Landing to Bronze (Decoupled & Parallel)
-- **Watchdog**: Scans `/landing/` for `.parquet` files.
-- **Parallelism**: Process up to **10 files concurrently** to minimize ingestion lag.
-- **Loading State**: Instantly rename local file to `_loading-<name>.parquet`.
-- **Action**: Upload to MinIO Bronze.
-- **Cleanup**: **Delete local file** after successful Bronze upload.
-- **State**: Create record in Postgres with status `new` → `bronze`.
-- **Fail-safe (Polling)**: Every 10 minutes, scan `/landing/` for files the watchdog missed; process them in parallel batches.
+### 1. Landing to Bronze (Triggered by Scheduler Tick)
+- **Official Trigger**: The `run_etl` function (called by the scheduler) initiates the ingestion.
+- **Workflow**:
+  1. Scan **`/landing/`** for `.parquet` files.
+  2. For each file:
+     - **Archive Check**: Skip if file already exists in **`/archive/`**.
+  3. Parallel Upload: Up to **10 files concurrently** uploaded to MinIO **`bronze`** bucket.
+  4. Finalize Ingestion:
+     - Update Postgres status directly to `bronze`.
+     - Move file from **`landing/`** to **`archive/`**.
 
-### 2. Bronze to Gold (Background Processing)
-- **Queue**: Process files in `bronze` status.
-- **Spark Job (Persistent Session)**:
-  - **Scheduler**: `FAIR` mode for multi-file processing efficiency.
-  - **Hardware Tuing** (i5-12450H):
-    ```python
-    spark = SparkSession.builder \
-        .config("spark.executor.cores", "2") \
-        .config("spark.scheduler.mode", "FAIR") \
-        .getOrCreate()
-    ```
-  - **Silver Stage**: Transformation, date/hour extraction, zone lookup.
-  - **Gold Stage**: Aggregate into StarRocks Primary Key tables.
-  - **Redis Sync**: Update `revenue_by_hour` in Redis.
-- **State**: Update Postgres status to `silver` → `gold`.
+### 2. Bronze to Gold (Spark Processing)
+- **Workflow**:
+  1. **Identify**: Find files with status `bronze`.
+  2. **Silver Stage**: 
+     - **Bulk Read**: Identify files with status `bronze` and read them in one Spark batch.
+     - **Transform**: Perform cleaning and extraction (date/hour).
+     - **Bulk Write**: Write to Silver (MinIO) **partitioned by `date`**.
+     - **State**: Update status to `silver` for the processed batch.
+  3. **Gold Stage**:
+     - **Bulk Read**: Read Silver data.
+     - **Aggregate**: Global aggregations per date/hour/zone.
+     - **Bulk Write**: Write to Gold (MinIO) **partitioned by `date`** and StarRocks tables.
+     - **State**: Update status to `gold`.
+
+
+### 3. Serving Sync (Redis)
+- **Workflow**:
+  1. **Identify**: Find files with status `gold`.
+  2. **Sync**: Update `revenue_by_hour` pre-aggregations in Redis.
+  3. **Finalize**: Update status to `done`.
 
 ---
 
@@ -86,5 +93,5 @@
 ---
 
 ## 🚑 Error Handling
-- **Scan**: Every 5 minutes, check for stuck files (status != `gold`).
-- **Reset**: If a file is stuck > 1 minute, increment `attempts` and reset status to `new` (re-triggering ingestion).
+- **Scan**: Every 5 minutes, check for stuck files (status != `done`).
+- **Reset**: If a file is stuck > 1 minute, increment `attempts` and reset status to `bronze` (re-triggering processing).

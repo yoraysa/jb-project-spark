@@ -21,7 +21,6 @@ help:
 	@echo "  make spark-producer-start   Start the file-drop producer inside spark-jupyter"
 	@echo "  make spark-producer-stop    Stop the running producer"
 	@echo "  make spark-producer-status  Show producer + bucket state"
-	@echo "  make spark-producer-reset   Clear landing/in_process/archive/errors buckets"
 	@echo ""
 
 lab-spark: lab-spark-down
@@ -32,10 +31,16 @@ lab-spark: lab-spark-down
 	@echo "   Jupyter (driver):   http://localhost:8888"
 	@echo "   Spark driver UI:    http://localhost:4040  (after a job runs)"
 	@echo "   Spark master UI:    http://localhost:8080"
-	@echo "   Postgres:           localhost:5432  (user=spark pass=spark db=taxi)"
+	@echo "   MinIO Console:      http://localhost:9001  (minioadmin/minioadmin)"
+	@echo "   Postgres:           localhost:5432  (user=spark pass=spark db=nyc_taxi)"
+	@echo "   pgAdmin (Postgres): http://localhost:5050  (admin@admin.com/admin)"
+	@echo "   StarRocks (MySQL):  localhost:9030  (root/no password)"
+	@echo "   Cloudbeaver (DB):   http://localhost:8978"
 	@echo "   Redis:              localhost:6379"
+	@echo "   Redis Insight:      http://localhost:5540"
 	@echo "   Producer:           make spark-producer-start / -status / -stop / -reset"
 	@echo "=============================================================="
+
 
 lab-spark-down:
 	docker compose down --remove-orphans
@@ -47,10 +52,12 @@ test-spark:
 	docker exec spark-jupyter pytest /home/jovyan/work/tests -v
 
 spark-migrate:
-	docker exec spark-jupyter python -c "from pipeline import config; from pipeline.migrate import migrate; migrate(config.postgres_kwargs()); print('[migrate] done')"
+	docker exec spark-jupyter python /home/jovyan/work/pipeline/migrate.py
 
 spark-reset:
-	docker exec spark-jupyter python -c "from pipeline import config; from pipeline.reset import reset_all; reset_all(config.postgres_kwargs(), config.redis_kwargs()); print('[reset] all stores wiped')"
+	-docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py stop
+	docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py reset
+	docker exec spark-jupyter python /home/jovyan/work/pipeline/reset.py
 
 spark-producer-start:
 	docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py start
@@ -60,6 +67,3 @@ spark-producer-stop:
 
 spark-producer-status:
 	docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py status
-
-spark-producer-reset:
-	docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py reset

@@ -45,27 +45,31 @@ def _holder_alive() -> bool:
         return False
 
 
-def _tick() -> None:
-    if _holder_alive():
-        print(f"[scheduler] previous submit still running (pid {LOCK_PATH.read_text().strip()}); skipping tick")
-        return
-    proc = subprocess.Popen(
-        [SPARK_SUBMIT, "--master", SPARK_MASTER, JOB_PATH],
-        stdout=sys.stdout, stderr=sys.stderr,
-    )
-    LOCK_PATH.write_text(str(proc.pid))
-    rc = proc.wait()
-    LOCK_PATH.unlink(missing_ok=True)
-    print(f"[scheduler] tick done (rc={rc})")
-
-
 def main() -> None:
     stop = False
+    current_proc: subprocess.Popen | None = None
+
+    def _tick() -> None:
+        nonlocal current_proc
+        if _holder_alive():
+            print(f"[scheduler] previous submit still running (pid {LOCK_PATH.read_text().strip()}); skipping tick")
+            return
+        current_proc = subprocess.Popen(
+            [SPARK_SUBMIT, "--master", SPARK_MASTER, JOB_PATH],
+            stdout=sys.stdout, stderr=sys.stderr,
+        )
+        LOCK_PATH.write_text(str(current_proc.pid))
+        rc = current_proc.wait()
+        current_proc = None
+        LOCK_PATH.unlink(missing_ok=True)
+        print(f"[scheduler] tick done (rc={rc})")
 
     def _graceful(_sig, _frame):
-        nonlocal stop
+        nonlocal stop, current_proc
         stop = True
-        print("[scheduler] stop requested; will exit after current tick")
+        print("[scheduler] stop requested; terminating current tick if any")
+        if current_proc is not None:
+            current_proc.terminate()
 
     signal.signal(signal.SIGINT, _graceful)
     signal.signal(signal.SIGTERM, _graceful)
@@ -74,9 +78,14 @@ def main() -> None:
     next_tick = time.monotonic()
     while not stop:
         _tick()
+        if stop: break
         next_tick += TICK_SECONDS
         delay = max(0.0, next_tick - time.monotonic())
-        time.sleep(delay)
+        if delay > 0:
+            # We use a short sleep loop to allow signal handlers to interrupt sleep faster or exit cleanly
+            end_sleep = time.monotonic() + delay
+            while time.monotonic() < end_sleep and not stop:
+                time.sleep(min(1.0, end_sleep - time.monotonic()))
 
 
 if __name__ == "__main__":

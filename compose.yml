@@ -6,7 +6,7 @@
 # Architecture:
 #   spark-master / spark-worker-1 / spark-worker-2   Spark Standalone cluster
 #   spark-jupyter                                    Driver + notebook + pipeline code
-#   spark-postgres                                   Analyst store (DB `taxi` only; no DDL)
+#   spark-postgres                                   Analyst store (DB `nyc_taxi` only; no DDL)
 #   spark-redis                                      Serving store (no keys pre-created)
 #   spark-producer                                   Lean cp loop: drops one day-file into
 #                                                    data/landing/ every 10s from data/days/
@@ -100,10 +100,10 @@ services:
       - PYSPARK_DRIVER_PYTHON=python3
       - PYTHONUNBUFFERED=1
       - SPARK_MASTER_URL=spark://spark-master:7077
-      - PG_URL=jdbc:postgresql://spark-postgres:5432/taxi
+      - PG_URL=jdbc:postgresql://spark-postgres:5432/nyc_taxi
       - PG_HOST=spark-postgres
       - PG_PORT=5432
-      - PG_DB=taxi
+      - PG_DB=nyc_taxi
       - PG_USER=spark
       - PG_PASSWORD=spark
       - REDIS_HOST=spark-redis
@@ -121,7 +121,7 @@ services:
       - STARROCKS_HOST=spark-starrocks
       - STARROCKS_FE_PORT=9030
       - STARROCKS_USER=root
-      - STARROCKS_PASSWORD=test
+      - STARROCKS_PASSWORD=
     working_dir: /home/jovyan/work
     volumes:
       - ./notebooks:/home/jovyan/work/notebooks
@@ -167,14 +167,14 @@ services:
     environment:
       - POSTGRES_USER=spark
       - POSTGRES_PASSWORD=spark
-      - POSTGRES_DB=taxi
+      - POSTGRES_DB=nyc_taxi
     ports:
       - "5432:5432"
     volumes:
       - spark_pg_data:/var/lib/postgresql/data
     mem_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spark -d taxi"]
+      test: ["CMD-SHELL", "pg_isready -U spark -d nyc_taxi"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -248,8 +248,14 @@ services:
       mc mb local/bronze || true;
       mc mb local/silver || true;
       mc mb local/gold || true;
-      exit 0;
+      sleep infinity
       "
+    healthcheck:
+      test: ["CMD-SHELL", "mc ls local/gold || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
 
   spark-starrocks:
     image: starrocks/allin1-ubuntu:3.2.10

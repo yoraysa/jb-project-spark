@@ -38,7 +38,7 @@ def postgres_kwargs() -> dict:
     return {
         "host": os.environ.get("PG_HOST", "spark-postgres"),
         "port": int(os.environ.get("PG_PORT", "5432")),
-        "dbname": os.environ.get("PG_DB", "taxi"),
+        "dbname": os.environ.get("PG_DB", "nyc_taxi"),
         "user": os.environ.get("PG_USER", "spark"),
         "password": os.environ.get("PG_PASSWORD", "spark"),
     }
@@ -46,7 +46,7 @@ def postgres_kwargs() -> dict:
 
 def postgres_jdbc() -> dict:
     return {
-        "url": os.environ.get("PG_URL", "jdbc:postgresql://spark-postgres:5432/taxi"),
+        "url": os.environ.get("PG_URL", "jdbc:postgresql://spark-postgres:5432/nyc_taxi"),
         "user": os.environ.get("PG_USER", "spark"),
         "password": os.environ.get("PG_PASSWORD", "spark"),
         "driver": "org.postgresql.Driver",

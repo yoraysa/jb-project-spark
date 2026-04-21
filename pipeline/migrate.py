@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import psycopg2
 import mysql.connector
 import boto3
@@ -9,7 +13,7 @@ def migrate(pg_kwargs: dict) -> None:
     """
     Idempotent initialization of the pipeline environment:
     - Postgres: etl_file_status table
-    - StarRocks: gold aggregated tables
+    - StarRocks: gold aggregated tables + external bucket tables
     - MinIO: bucket cleanup/creation
     - Redis: cache clearing
     """
@@ -19,9 +23,8 @@ def migrate(pg_kwargs: dict) -> None:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS etl_file_status (
                 file_path TEXT PRIMARY KEY,
-                status VARCHAR(20) NOT NULL DEFAULT 'new',
+                status VARCHAR(20) NOT NULL DEFAULT 'bronze',
                 etl_attempts INT DEFAULT 0,
-                status_new_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 status_bronze_ts TIMESTAMP,
                 status_silver_ts TIMESTAMP,
                 status_gold_ts TIMESTAMP,
@@ -32,41 +35,104 @@ def migrate(pg_kwargs: dict) -> None:
     conn_pg.commit()
     conn_pg.close()
 
-    # 2. StarRocks - Gold Tables
+    # 2. StarRocks - Gold Tables & External Bucket Tables
     sr_cfg = config.starrocks_kwargs()
+    m_cfg = config.minio_kwargs()
+    
     conn_sr = mysql.connector.connect(**sr_cfg)
-    with conn_sr.cursor() as cur:
-        # Create database if not exists
-        cur.execute("CREATE DATABASE IF NOT EXISTS taxi_gold;")
-        cur.execute("USE taxi_gold;")
-        
-        # Table: datehour_agg
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS datehour_agg (
-                date DATE NOT NULL,
-                hour INT NOT NULL,
-                revenue DECIMAL(18, 2) NOT NULL
-            ) PRIMARY KEY (date, hour)
-            DISTRIBUTED BY HASH(date, hour) BUCKETS 4
-            PROPERTIES ("replication_num" = "1");
-        """)
-        
-        # Table: zonehour_agg
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS zonehour_agg (
-                zone VARCHAR(255) NOT NULL,
-                date DATE NOT NULL,
-                hour INT NOT NULL,
-                total_amount DECIMAL(18, 2) NOT NULL
-            ) PRIMARY KEY (zone, date, hour)
-            DISTRIBUTED BY HASH(zone, date, hour) BUCKETS 4
-            PROPERTIES ("replication_num" = "1");
-        """)
-    conn_sr.commit()
-    conn_sr.close()
+    try:
+        with conn_sr.cursor() as cur:
+            # Create database if not exists
+            cur.execute("CREATE DATABASE IF NOT EXISTS nyc_taxi;")
+            cur.execute("USE nyc_taxi;")
+
+
+            # --- EXTERNAL BUCKET TABLES ---
+            common_s3_props = f"""
+                "aws.s3.endpoint" = "{m_cfg['endpoint']}",
+                "aws.s3.access_key" = "{m_cfg['access_key']}",
+                "aws.s3.secret_key" = "{m_cfg['secret_key']}",
+                "aws.s3.region" = "us-east-1",
+                "aws.s3.enable_path_style_access" = "true",
+                "enable_recursive_listing" = "true",
+                "format" = "parquet"
+            """
+
+            cur.execute(f"""
+                CREATE EXTERNAL TABLE IF NOT EXISTS bronze (
+                    VendorID BIGINT,
+                    tpep_pickup_datetime DATETIME,
+                    tpep_dropoff_datetime DATETIME,
+                    passenger_count DOUBLE,
+                    trip_distance DOUBLE,
+                    RatecodeID DOUBLE,
+                    store_and_fwd_flag STRING,
+                    PULocationID BIGINT,
+                    DOLocationID BIGINT,
+                    payment_type BIGINT,
+                    fare_amount DOUBLE,
+                    extra DOUBLE,
+                    mta_tax DOUBLE,
+                    tip_amount DOUBLE,
+                    tolls_amount DOUBLE,
+                    improvement_surcharge DOUBLE,
+                    total_amount DOUBLE,
+                    congestion_surcharge DOUBLE
+                ) 
+                ENGINE=file
+                PROPERTIES (
+                    "path" = "s3://bronze/trips/",
+                    {common_s3_props}
+                );
+            """)
+
+            cur.execute(f"""
+                CREATE EXTERNAL TABLE IF NOT EXISTS silver (
+                    date DATE,
+                    hour INT,
+                    PULocationID INT,
+                    total_amount DECIMAL(18, 2)
+                ) 
+                ENGINE=file
+                PROPERTIES (
+                    "path" = "s3://silver/trips/",
+                    {common_s3_props}
+                );
+            """)
+
+
+            # --- AGGREGATED GOLD TABLES ---
+            
+            # Table: gold_hourly_revenue (Summed hourly revenue across all days)
+            # Uses PRIMARY KEY to support Spark-driven sum + upsert logic.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gold_hourly_revenue (
+                    hour INT NOT NULL,
+                    revenue DECIMAL(18, 2) NOT NULL
+                ) PRIMARY KEY (hour)
+                DISTRIBUTED BY HASH(hour) BUCKETS 4
+                PROPERTIES ("replication_num" = "1");
+            """)
+            
+            # Table: gold_hour_denorm (By Zone and Hour)
+            # Uses AGGREGATE KEY to automatically handle multi-file contributions.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gold_hour_denorm (
+                    zone VARCHAR(255) NOT NULL,
+                    date DATE NOT NULL,
+                    hour INT NOT NULL,
+                    total_amount DECIMAL(18, 2) SUM NOT NULL
+                ) AGGREGATE KEY (zone, date, hour)
+                DISTRIBUTED BY HASH(zone, date, hour) BUCKETS 4
+                PROPERTIES ("replication_num" = "1");
+            """)
+
+
+        conn_sr.commit()
+    finally:
+        conn_sr.close()
 
     # 3. MinIO - Datalake Buckets
-    m_cfg = config.minio_kwargs()
     s3 = boto3.resource('s3',
         endpoint_url=m_cfg['endpoint'],
         aws_access_key_id=m_cfg['access_key'],
@@ -77,12 +143,9 @@ def migrate(pg_kwargs: dict) -> None:
     
     buckets = ['bronze', 'silver', 'gold']
     for b in buckets:
-        bucket = s3.Bucket(b)
-        if bucket.creation_date:
-            # For reset purposes, we could clear the bucket here if needed
-            # For now, we'll just ensure they exist (minio-init handles this too)
-            pass
-        else:
+        try:
+            s3.meta.client.head_bucket(Bucket=b)
+        except:
             s3.create_bucket(Bucket=b)
 
     # 4. Redis - Cache Clearing
@@ -92,5 +155,4 @@ def migrate(pg_kwargs: dict) -> None:
     print("✅ Migration complete: Postgres, StarRocks, MinIO, and Redis initialized.")
 
 if __name__ == "__main__":
-    # Allow running directly for testing
     migrate(config.postgres_kwargs())
