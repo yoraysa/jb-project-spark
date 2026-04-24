@@ -52,7 +52,7 @@ test-spark:
 	docker exec spark-jupyter pytest /home/jovyan/work/tests -v
 
 spark-migrate:
-	docker exec spark-jupyter python /home/jovyan/work/pipeline/migrate.py
+	docker exec spark-jupyter python /home/jovyan/work/pipeline/migrate/__init__.py
 
 spark-reset:
 	-docker exec spark-jupyter python /home/jovyan/work/scripts/producer.py stop

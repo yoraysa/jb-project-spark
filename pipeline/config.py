@@ -84,3 +84,25 @@ def starrocks_jdbc() -> dict:
         "password": os.environ.get("STARROCKS_PASSWORD", ""),
         "driver": "com.mysql.cj.jdbc.Driver",
     }
+
+
+def spark_session(app_name: str = "ETL") -> "SparkSession":
+    """Centralized SparkSession creation with common jars and configs."""
+    from pyspark.sql import SparkSession
+    return (SparkSession.builder
+        .appName(app_name)
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,mysql:mysql-connector-java:8.0.28")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.default.parallelism", "4")
+        .getOrCreate())
+
+
+connections = {
+    "paths": paths(),
+    "postgres": postgres_kwargs(),
+    "postgres_jdbc": postgres_jdbc(),
+    "redis": redis_kwargs(),
+    "minio": minio_kwargs(),
+    "starrocks": starrocks_kwargs(),
+    "starrocks_jdbc": starrocks_jdbc(),
+}
