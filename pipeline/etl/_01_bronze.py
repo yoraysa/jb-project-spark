@@ -24,6 +24,7 @@ def run_bronze_phase(landing_dir: str) -> None:
     landing_path = Path(landing_dir)
     archive_dir = paths["archive"] if isinstance(paths, dict) else paths.archive
     archive_path = Path(archive_dir)
+    archive_path.mkdir(parents=True, exist_ok=True)
 
     # Initialize S3 client
     s3 = boto3.client('s3',
